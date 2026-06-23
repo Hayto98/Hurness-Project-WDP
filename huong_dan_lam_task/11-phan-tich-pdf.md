@@ -1,150 +1,127 @@
 # 📄 Chức năng 11: Phân tích Full-text PDF
 
 > **Loại:** AI Feature | **Priority:** 🟡 MEDIUM
-> **Liên quan:** FR-009
+> **Stack Backend:** Python (FastAPI + PyMuPDF + LangChain/OpenAI)
 
 ---
 
 ## Mô tả
-
-Khi user upload PDF, hệ thống trích xuất nội dung, tóm tắt, sinh keyword, tìm paper tương tự.
+Python là "vua" trong xử lý PDF và AI. Chức năng này sử dụng `PyMuPDF` để đọc PDF cực chuẩn, và `LangChain` kết nối với LLM để trích xuất thông tin.
 
 ---
 
 ## Bước thực hiện
 
-### Packages cần cài
+### 1. Cài đặt thư viện
 
-```
-npm install pdf-parse multer
-```
-
-### API
-
-```
-POST /api/papers/upload-pdf
-  Content-Type: multipart/form-data
-  Body: file (PDF)
-
-Response:
-{
-  "metadata": { "title", "authors", "abstract" },
-  "summary": "AI-generated summary...",
-  "keywords": ["LLM", "RAG", ...],
-  "topics": ["Natural Language Processing"],
-  "similar_papers": [{ "_id", "title", "similarity": 0.92 }],
-  "references": ["doi:10.xxx", ...]
-}
+```bash
+pip install fastapi uvicorn python-multipart pymupdf langchain langchain-openai
 ```
 
-### Controller
+### 2. Trích xuất Text từ PDF bằng PyMuPDF (fitz)
 
-```js
-const pdfParse = require('pdf-parse');
-const multer = require('multer');
-const upload = multer({ limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB
+```python
+# services/pdf_service.py
+import fitz # PyMuPDF
+import io
 
-async function uploadAndAnalyzePDF(req, res) {
-  const buffer = req.file.buffer;
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    # Mở PDF từ byte stream (không cần lưu file tạm)
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    text = ""
+    
+    # Đọc tối đa 10 trang đầu để tiết kiệm token LLM
+    for page_num in range(min(10, doc.page_count)):
+        page = doc.load_page(page_num)
+        text += page.get_text("text") + "\n"
+        
+    return text
 
-  // 1. Trích xuất text từ PDF
-  const pdfData = await pdfParse(buffer);
-  const fullText = pdfData.text;
-
-  // 2. Dùng AI trích xuất metadata
-  const metadata = await extractMetadataWithAI(fullText.substring(0, 5000));
-
-  // 3. Tóm tắt
-  const summary = await summarizeWithAI(fullText.substring(0, 10000));
-
-  // 4. Sinh keywords
-  const keywords = await extractKeywordsWithAI(fullText.substring(0, 5000));
-
-  // 5. Tìm paper tương tự (search bằng title + abstract trích được)
-  const similar = await Paper.find({
-    $text: { $search: metadata.title }
-  }).limit(5).select('title authors publication_year doi');
-
-  // 6. Trích references
-  const references = extractReferences(fullText);
-
-  res.json({ metadata, summary, keywords, similar_papers: similar, references });
-}
-
-async function extractMetadataWithAI(text) {
-  const prompt = `Extract metadata from this paper text. Return JSON:
-{ "title": "...", "authors": ["..."], "abstract": "..." }
-
-Text: ${text}`;
-  return JSON.parse(await callLLM(prompt));
-}
-
-async function summarizeWithAI(text) {
-  const prompt = `Summarize this research paper in 5 sentences: ${text}`;
-  return await callLLM(prompt);
-}
-
-async function extractKeywordsWithAI(text) {
-  const prompt = `Extract 10 research keywords from this paper. Return as JSON array: ${text}`;
-  return JSON.parse(await callLLM(prompt));
-}
-
-function extractReferences(text) {
-  // Tìm DOI pattern trong text
-  const doiRegex = /10\.\d{4,9}\/[-._;()/:A-Z0-9]+/gi;
-  return [...new Set(text.match(doiRegex) || [])];
-}
+def extract_references_regex(text: str) -> list:
+    import re
+    # Tìm chuẩn DOI
+    doi_pattern = r"10.\d{4,9}/[-._;()/:A-Z0-9]+"
+    dois = re.findall(doi_pattern, text, re.IGNORECASE)
+    return list(set(dois))
 ```
 
----
+### 3. Dùng LangChain để trích xuất & Tóm tắt
 
-## Frontend
+```python
+# services/ai_service.py
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from pydantic import BaseModel, Field
 
-```jsx
-function PDFUpload() {
-  const [result, setResult] = useState(null);
-  const [loading, setLoading] = useState(false);
+# Định nghĩa Schema đầu ra cho LangChain
+class PaperMetadata(BaseModel):
+    title: str = Field(description="Title of the paper")
+    authors: list[str] = Field(description="List of authors")
+    abstract: str = Field(description="The abstract of the paper")
+    keywords: list[str] = Field(description="5-10 research keywords")
 
-  const handleUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-    setLoading(true);
-    const formData = new FormData();
-    formData.append('file', file);
+async def analyze_paper_content(text: str):
+    # LLM Structured Output (JSON)
+    structured_llm = llm.with_structured_output(PaperMetadata)
+    
+    prompt = f"""
+    Extract the metadata and keywords from the following academic paper text.
+    Text (first few pages):
+    {text[:5000]}
+    """
+    
+    # Gọi AI
+    result = structured_llm.invoke(prompt)
+    
+    # Tóm tắt
+    summary_prompt = f"Summarize this paper in 3 bullet points:\n{text[:8000]}"
+    summary_res = llm.invoke(summary_prompt)
+    
+    return {
+        "metadata": result.dict(),
+        "summary": summary_res.content
+    }
+```
 
-    const res = await api.post('/api/papers/upload-pdf', formData);
-    setResult(res.data);
-    setLoading(false);
-  };
+### 4. FastAPI Endpoint
 
-  return (
-    <div>
-      <input type="file" accept=".pdf" onChange={handleUpload} />
-      {loading && <p>🔄 Đang phân tích PDF...</p>}
-      {result && (
-        <div>
-          <h3>{result.metadata.title}</h3>
-          <p><strong>Summary:</strong> {result.summary}</p>
-          <p><strong>Keywords:</strong> {result.keywords.join(', ')}</p>
-          <h4>Similar Papers:</h4>
-          <ul>
-            {result.similar_papers.map(p => <li key={p._id}>{p.title}</li>)}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
+```python
+# main.py
+from fastapi import FastAPI, UploadFile, File
+from services.pdf_service import extract_text_from_pdf, extract_references_regex
+from services.ai_service import analyze_paper_content
+
+app = FastAPI()
+
+@app.post("/api/papers/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    # Lấy byte data
+    file_bytes = await file.read()
+    
+    # 1. OCR / Text Extraction
+    text = extract_text_from_pdf(file_bytes)
+    
+    # 2. AI Analysis
+    analysis = await analyze_paper_content(text)
+    
+    # 3. Trích xuất tài liệu tham khảo
+    references = extract_references_regex(text)
+    
+    return {
+        "title": analysis["metadata"]["title"],
+        "authors": analysis["metadata"]["authors"],
+        "abstract": analysis["metadata"]["abstract"],
+        "keywords": analysis["metadata"]["keywords"],
+        "summary": analysis["summary"],
+        "references_dois": references
+    }
 ```
 
 ---
 
 ## Checklist kiểm tra
-
-- [ ] Upload PDF → trích xuất text thành công
-- [ ] AI trả về metadata (title, authors, abstract)
-- [ ] Summary có ý nghĩa
-- [ ] Keywords liên quan đến nội dung
-- [ ] Similar papers tìm đúng
-- [ ] References (DOI) trích xuất đúng
+- [ ] `PyMuPDF` đọc PDF không bị lỗi font so với các thư viện JS.
+- [ ] `LangChain` trả về JSON `PaperMetadata` chuẩn định dạng.
+- [ ] Regex bắt được DOI ở phần References cuối PDF.

@@ -1,250 +1,170 @@
 # 📦 Chức năng 1: Quản lý Dữ liệu Nghiên cứu (Research Data Management)
 
 > **Loại:** Nền tảng (Foundation) | **Priority:** 🔴 HIGH
-> **Liên quan:** ISSUE-001, ISSUE-003 | **FR:** FR-001, FR-002
+> **Stack Backend:** Python (FastAPI + Pandas + Motor/MongoDB)
 
 ---
 
 ## 1.1 Thu thập dữ liệu (Data Collection)
 
 ### Mô tả
-Crawl metadata bài báo từ 6 nguồn học thuật, đồng bộ định kỳ và cập nhật bài mới.
-
-### Nguồn dữ liệu
-
-| Nguồn | API Type | Rate Limit | Ghi chú |
-|---|---|---|---|
-| Semantic Scholar | REST | 100 req/5min (free) | Có academic API key tăng limit |
-| OpenAlex | REST | Không limit (polite pool) | Thêm `mailto` vào header |
-| Crossref | REST | 50 req/s (với key) | Dùng `Crossref-Plus-API-Token` |
-| arXiv | OAI-PMH / REST | 1 req/3s | XML format, cần parse |
-| IEEE Xplore | REST | 200 req/day (free) | Cần API key |
-| ACM Digital Library | REST / Scraping | Hạn chế | Cân nhắc dùng Crossref thay thế |
+Crawl metadata bài báo từ các nguồn học thuật bằng Python `httpx` (async) hoặc `requests`, xử lý dữ liệu lớn bằng `Pandas`.
 
 ### Bước thực hiện
 
 ```
-src/services/etl/
-  connectors/
-    openalex.connector.js
-    semanticscholar.connector.js
-    crossref.connector.js
-    arxiv.connector.js
-    ieee.connector.js
-    acm.connector.js
-  etl.manager.js          ← orchestrate tất cả connectors
+src/
+  services/
+    etl/
+      openalex_connector.py
+      arxiv_connector.py
+      etl_manager.py
+  main.py
 ```
 
-**Mỗi connector phải implement interface chung:**
+**Mỗi connector kế thừa từ Base class:**
 
-```js
-class BaseConnector {
-  async fetch(query, options) { }     // Lấy papers
-  normalize(rawData) { }              // Chuẩn hóa về schema chung
-  async syncIncremental(since) { }    // Chỉ lấy papers mới từ ngày `since`
-}
+```python
+# services/etl/base_connector.py
+from abc import ABC, abstractmethod
+
+class BaseConnector(ABC):
+    @abstractmethod
+    async def fetch(self, query: str, options: dict):
+        pass
+        
+    @abstractmethod
+    def normalize(self, raw_data: dict) -> dict:
+        pass
 ```
 
-**Ví dụ OpenAlex connector:**
+**Ví dụ OpenAlex connector (Python):**
 
-```js
-const axios = require('axios');
+```python
+# services/etl/openalex_connector.py
+import httpx
+from .base_connector import BaseConnector
 
-class OpenAlexConnector extends BaseConnector {
-  constructor() {
-    this.baseUrl = 'https://api.openalex.org';
-  }
+class OpenAlexConnector(BaseConnector):
+    def __init__(self):
+        self.base_url = "https://api.openalex.org/works"
+        self.mailto = "admin@yourdomain.com" # Polite pool
 
-  async fetch(query, { page = 1, perPage = 50 }) {
-    const res = await axios.get(`${this.baseUrl}/works`, {
-      params: {
-        search: query,
-        page,
-        per_page: perPage,
-        mailto: process.env.ADMIN_EMAIL // polite pool
-      }
-    });
-    return res.data.results.map(r => this.normalize(r));
-  }
+    async def fetch(self, query: str, page: int = 1, per_page: int = 50):
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                self.base_url,
+                params={
+                    "search": query,
+                    "page": page,
+                    "per_page": per_page,
+                    "mailto": self.mailto
+                },
+                timeout=30.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            return [self.normalize(item) for item in data.get("results", [])]
 
-  normalize(raw) {
-    return {
-      doi: raw.doi?.replace('https://doi.org/', ''),
-      title: raw.title,
-      abstract: raw.abstract_inverted_index
-        ? this._reconstructAbstract(raw.abstract_inverted_index)
-        : null,
-      keywords: raw.keywords?.map(k => k.keyword) || [],
-      authors: raw.authorships?.map(a => ({
-        name: a.author?.display_name,
-        affiliation: a.institutions?.[0]?.display_name,
-        orcid: a.author?.orcid
-      })) || [],
-      publication_year: raw.publication_year,
-      source_venue: {
-        name: raw.primary_location?.source?.display_name,
-        type: raw.primary_location?.source?.type,
-        issn: raw.primary_location?.source?.issn_l
-      },
-      data_source: 'openalex',
-      fields_of_study: raw.concepts?.map(c => c.display_name) || [],
-      citation_count: raw.cited_by_count || 0,
-      open_access_url: raw.open_access?.oa_url,
-      external_ids: {
-        openalex_id: raw.id
-      }
-    };
-  }
-}
-```
-
-**Đồng bộ định kỳ (Cron job):**
-
-```js
-const cron = require('node-cron');
-
-// Chạy lúc 2AM mỗi ngày
-cron.schedule('0 2 * * *', async () => {
-  const sources = await DataSource.find({ is_active: true });
-  for (const source of sources) {
-    await DataSource.findByIdAndUpdate(source._id, { last_sync_status: 'running' });
-    try {
-      const connector = getConnector(source.name);
-      const newPapers = await connector.syncIncremental(source.last_sync_at);
-      // ... insert vào DB
-      await DataSource.findByIdAndUpdate(source._id, {
-        last_sync_at: new Date(),
-        last_sync_status: 'success',
-        'sync_stats.new_added': newPapers.length
-      });
-    } catch (err) {
-      await DataSource.findByIdAndUpdate(source._id, { last_sync_status: 'failed' });
-    }
-  }
-});
+    def normalize(self, raw: dict) -> dict:
+        return {
+            "doi": raw.get("doi", "").replace("https://doi.org/", "") if raw.get("doi") else None,
+            "title": raw.get("title"),
+            "abstract": self._reconstruct_abstract(raw.get("abstract_inverted_index")),
+            "publication_year": raw.get("publication_year"),
+            "data_source": "openalex",
+            "external_ids": {"openalex_id": raw.get("id")}
+        }
+        
+    def _reconstruct_abstract(self, inverted_index: dict) -> str:
+        if not inverted_index: return ""
+        # Logic gộp abstract từ inverted index
+        word_index = []
+        for word, positions in inverted_index.items():
+            for pos in positions:
+                word_index.append((pos, word))
+        word_index.sort(key=lambda x: x[0])
+        return " ".join([word for _, word in word_index])
 ```
 
 ---
 
-## 1.2 Import dữ liệu (Data Import)
+## 1.2 Import & Làm sạch dữ liệu với Pandas
 
 ### Mô tả
-Cho phép user upload file để import bài báo thủ công.
+Sử dụng thư viện `Pandas` của Python để xử lý hàng triệu bản ghi, loại bỏ trùng lặp cực nhanh trước khi insert vào MongoDB.
 
-### Định dạng hỗ trợ
+### API FastAPI xử lý Import
 
-| Format | Thư viện | Ghi chú |
-|---|---|---|
-| BibTeX | `bibtex-parse-js` | Phổ biến nhất, export từ Google Scholar |
-| RIS | `ris-parser` | Export từ Scopus, Web of Science |
-| CSV | `csv-parser` | Custom template |
-| PDF | `pdf-parse` + LLM | Trích xuất metadata từ full-text |
+```python
+# main.py
+from fastapi import FastAPI, UploadFile, File
+import pandas as pd
+from io import StringIO
+from motor.motor_asyncio import AsyncIOMotorClient
 
-### API
+app = FastAPI()
+client = AsyncIOMotorClient("mongodb://localhost:27017")
+db = client.hurness_db
 
-```
-POST /api/papers/import
-  Content-Type: multipart/form-data
-  Body: file (bibtex|ris|csv|pdf)
-  Response: { imported: 15, duplicates: 3, errors: 1 }
-```
-
-### Bước thực hiện
-
-```js
-// controllers/import.controller.js
-const multer = require('multer');
-const bibtex = require('bibtex-parse-js');
-
-async function importBibtex(req, res) {
-  const content = req.file.buffer.toString();
-  const entries = bibtex.toJSON(content);
-
-  let imported = 0, duplicates = 0;
-  for (const entry of entries) {
-    const paper = normalizeBibtex(entry);
-    try {
-      await Paper.create(paper);
-      imported++;
-    } catch (err) {
-      if (err.code === 11000) duplicates++; // duplicate DOI
-      else throw err;
-    }
-  }
-  res.json({ imported, duplicates });
-}
+@app.post("/api/papers/import-csv")
+async def import_csv(file: UploadFile = File(...)):
+    contents = await file.read()
+    
+    # 1. Load vào Pandas DataFrame
+    df = pd.read_csv(StringIO(contents.decode('utf-8')))
+    
+    # 2. Làm sạch: Drop duplicate DOI
+    df = df.dropna(subset=['doi'])
+    df = df.drop_duplicates(subset=['doi'], keep='last')
+    
+    # 3. Chuẩn hóa text
+    df['title'] = df['title'].str.strip().str.title()
+    df['keywords'] = df['keywords'].apply(lambda x: [k.strip().lower() for k in str(x).split(',') if k])
+    
+    # 4. Insert vào MongoDB (Bulk Write)
+    records = df.to_dict('records')
+    try:
+        await db.papers.insert_many(records, ordered=False)
+        return {"imported": len(records), "status": "success"}
+    except Exception as e:
+        return {"status": "partial_success", "error": str(e)}
 ```
 
----
+### Dedup định kỳ (Data Cleaning Job)
 
-## 1.3 Làm sạch dữ liệu (Data Cleaning)
+```python
+# services/cleaning_service.py
+import pandas as pd
 
-### Mô tả
-Đảm bảo chất lượng dữ liệu trong Research Corpus.
-
-### Logic xử lý
-
-| Vấn đề | Giải pháp |
-|---|---|
-| **Bài trùng** | Dedup theo `doi` (unique sparse index) + fuzzy match title |
-| **Tên tác giả** | Chuẩn hóa: `"J. Smith"` → `"John Smith"` (dùng ORCID khi có) |
-| **Tên hội nghị** | Mapping: `"CVPR"`, `"IEEE CVPR"`, `"CVPR 2023"` → `"CVPR"` |
-| **Keywords** | Lowercase, trim, loại bỏ duplicate, merge synonyms |
-
-### Bước thực hiện
-
-```js
-// services/cleaning.service.js
-
-// 1. Dedup theo DOI
-async function deduplicateByDoi() {
-  const pipeline = [
-    { $group: { _id: '$doi', count: { $sum: 1 }, ids: { $push: '$_id' } } },
-    { $match: { count: { $gt: 1 }, _id: { $ne: null } } }
-  ];
-  const duplicates = await Paper.aggregate(pipeline);
-  for (const dup of duplicates) {
-    // Giữ bản mới nhất, merge external_ids từ bản cũ
-    const [keep, ...remove] = dup.ids;
-    await Paper.deleteMany({ _id: { $in: remove } });
-  }
-}
-
-// 2. Chuẩn hóa keyword
-function normalizeKeyword(keyword) {
-  return keyword.trim().toLowerCase()
-    .replace(/\s+/g, ' ')            // multi space → single
-    .replace(/['']/g, "'");          // smart quotes
-}
+async def deduplicate_db():
+    # Lấy toàn bộ DOI từ DB
+    cursor = db.papers.find({"doi": {"$ne": None}}, {"_id": 1, "doi": 1})
+    data = await cursor.to_list(length=None)
+    
+    if not data: return
+    
+    df = pd.DataFrame(data)
+    
+    # Tìm các DOI xuất hiện > 1 lần
+    duplicates = df[df.duplicated('doi', keep=False)]
+    
+    if duplicates.empty: return
+    
+    # Giữ lại document đầu tiên, xóa phần còn lại
+    to_keep = duplicates.drop_duplicates('doi', keep='first')
+    to_delete = duplicates[~duplicates['_id'].isin(to_keep['_id'])]
+    
+    # Xóa khỏi MongoDB
+    delete_ids = to_delete['_id'].tolist()
+    await db.papers.delete_many({"_id": {"$in": delete_ids}})
+    print(f"Removed {len(delete_ids)} duplicate papers.")
 ```
-
----
-
-## 1.4 Quản lý Metadata
-
-### Schema `papers` — đầy đủ các trường
-
-| Trường | Mô tả | Bắt buộc |
-|---|---|---|
-| `title` | Tiêu đề bài báo | ✅ |
-| `abstract` | Tóm tắt | |
-| `authors[]` | `{name, affiliation, orcid}` | ✅ |
-| `publication_year` | Năm xuất bản | ✅ |
-| `doi` | Digital Object Identifier | (sparse) |
-| `citation_count` | Số lần trích dẫn | |
-| `keywords[]` | Từ khóa | |
-| `fields_of_study[]` | Lĩnh vực | |
-| `source_venue` | `{name, type, issn}` — journal/conference | |
-| `open_access_url` | Link đọc miễn phí | |
-| `external_ids` | ID từ các nguồn: openalex, s2, arxiv... | |
-| `data_source` | Nguồn thu thập | ✅ |
 
 ---
 
 ## Checklist kiểm tra
-
-- [ ] OpenAlex connector: fetch 100 papers → insert đúng vào DB
-- [ ] Dedup: insert cùng DOI 2 lần → chỉ 1 document
-- [ ] Import BibTeX: upload file → papers xuất hiện trong DB
-- [ ] Cron job: chạy đúng giờ, cập nhật `data_sources.sync_stats`
-- [ ] Author normalization: `"J. Smith"` thống nhất khi có ORCID
+- [ ] Chạy FastAPI server (`uvicorn main:app --reload`)
+- [ ] Test OpenAlex connector fetch data bằng `httpx` không bị timeout
+- [ ] Pandas deduplicate DOI đúng
+- [ ] Bulk insert MongoDB hoạt động mượt với file >10,000 dòng

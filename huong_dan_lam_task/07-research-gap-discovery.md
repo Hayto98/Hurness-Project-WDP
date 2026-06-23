@@ -1,204 +1,138 @@
 # 🗺️ Chức năng 7: Phân tích Ngách Nghiên cứu (Research Gap Discovery)
 
 > **Loại:** AI Feature | **Priority:** 🔴 HIGH
-> **Liên quan:** ISSUE-006 | **FR:** FR-006
-> **Màn hình:** SCR-004 (`/analysis/gap`)
+> **Stack Backend:** Python (FastAPI + LangChain)
 
 ---
 
 ## Mô tả
-
-Phân tích mật độ bài báo theo chuỗi topic để tìm vùng ít được khai thác.
-
-```
-User nhập: "LLM"
-  → LLM: 500,000 papers
-    → LLM + Agriculture: 3,000 papers
-      → LLM + Smart Farming: 150 papers
-        → LLM + Rice Disease Detection: 12 papers
-          ⇒ 🟢 Research Opportunity!
-```
+Phân tích mật độ bài báo theo chuỗi topic để tìm vùng ít được khai thác. Khi không có sub-topics sẵn trong CSDL, hệ thống dùng LLM (thông qua LangChain) để tự động gợi ý các hướng rẽ nhánh hẹp hơn.
 
 ---
 
-## Backend — Gap Engine
+## Bước thực hiện
 
-### Logic tính Gap Score
+### 1. Viết Gap Engine kết hợp MongoDB và LangChain
 
-```js
-// services/gap.engine.js
+```python
+# services/gap_engine.py
+from motor.motor_asyncio import AsyncIOMotorClient
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
 
-async function analyzeResearchGap(keyword, depth = 4) {
-  const results = [];
+client = AsyncIOMotorClient("mongodb://localhost:27017")
+db = client.hurness_db
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
 
-  async function drill(currentKeyword, level) {
-    if (level > depth) return;
+class SubTopics(BaseModel):
+    topics: list[str] = Field(description="List of 5 narrow sub-topics")
 
-    // Đếm papers cho keyword hiện tại
-    const count = await Paper.countDocuments({
-      $text: { $search: `"${currentKeyword}"` }
-    });
+async def suggest_narrow_topics(keyword: str) -> list[str]:
+    # Sử dụng LangChain structured output
+    structured_llm = llm.with_structured_output(SubTopics)
+    
+    prompt = f"""
+    For the research topic "{keyword}", suggest 5 specific sub-topics 
+    or application domains that narrow down the research scope significantly.
+    Find niche areas where few papers might exist.
+    """
+    
+    res = structured_llm.invoke(prompt)
+    return res.topics
 
-    // Lấy sub-topics từ topics collection
-    const topic = await Topic.findOne({
-      $or: [
-        { name: { $regex: currentKeyword, $options: 'i' } },
-        { aliases: { $regex: currentKeyword, $options: 'i' } }
-      ]
-    });
+def classify_gap(paper_count: int) -> dict:
+    if paper_count > 10000:
+        return {"level": "saturated", "label": "🔴 Bão hòa", "color": "red"}
+    if paper_count > 1000:
+        return {"level": "established", "label": "🟡 Đã phát triển", "color": "yellow"}
+    if paper_count > 100:
+        return {"level": "emerging", "label": "🟢 Đang phát triển", "color": "green"}
+    if paper_count > 10:
+        return {"level": "opportunity", "label": "💎 Research Opportunity", "color": "blue"}
+    return {"level": "gap", "label": "⭐ Research Gap!", "color": "gold"}
 
-    const subTopics = topic
-      ? await Topic.find({ parent_topic_id: topic._id }).select('name gap_score')
-      : [];
+async def analyze_research_gap(keyword: str, depth: int = 3, current_level: int = 0):
+    if current_level > depth:
+        return None
 
-    // Nếu không có sub-topics, dùng AI gợi ý
-    const narrowTopics = subTopics.length > 0
-      ? subTopics.map(t => t.name)
-      : await suggestNarrowTopics(currentKeyword);
+    # Đếm số lượng papers có keyword này (Text Search)
+    count = await db.papers.count_documents(
+        {"$text": {"$search": f'"{keyword}"'}}
+    )
 
-    const node = {
-      keyword: currentKeyword,
-      paper_count: count,
-      level,
-      gap_level: classifyGap(count),
-      children: []
-    };
+    # Tìm sub_topics từ CSDL (nếu có)
+    topic_doc = await db.topics.find_one({"name": {"$regex": f"^{keyword}$", "$options": "i"}})
+    
+    narrow_topics = []
+    if topic_doc:
+        sub_cursor = db.topics.find({"parent_topic_id": topic_doc["_id"]}).limit(5)
+        subs = await sub_cursor.to_list(length=5)
+        narrow_topics = [s["name"] for s in subs]
+    
+    # Nếu không có trong DB, dùng AI gợi ý
+    if not narrow_topics:
+        narrow_topics = await suggest_narrow_topics(keyword)
 
-    // Drill-down vào sub-topics có ít papers
-    for (const sub of narrowTopics.slice(0, 5)) {
-      const combined = `${keyword} ${sub}`;
-      const childNode = await drill(combined, level + 1);
-      if (childNode) node.children.push(childNode);
+    node = {
+        "keyword": keyword,
+        "paper_count": count,
+        "level": current_level,
+        "gap_level": classify_gap(count),
+        "children": []
     }
 
-    results.push(node);
-    return node;
-  }
+    # Đệ quy (Drill-down)
+    for sub in narrow_topics[:3]: # Chỉ lấy 3 nhánh để tránh API call quá lâu
+        combined_kw = f"{keyword} {sub}"
+        child_node = await analyze_research_gap(combined_kw, depth, current_level + 1)
+        if child_node:
+            node["children"].append(child_node)
 
-  return drill(keyword, 0);
-}
-
-function classifyGap(paperCount) {
-  if (paperCount > 10000) return { level: 'saturated', label: '🔴 Bão hòa', color: 'red' };
-  if (paperCount > 1000) return { level: 'established', label: '🟡 Đã phát triển', color: 'yellow' };
-  if (paperCount > 100) return { level: 'emerging', label: '🟢 Đang phát triển', color: 'green' };
-  if (paperCount > 10) return { level: 'opportunity', label: '💎 Research Opportunity', color: 'blue' };
-  return { level: 'gap', label: '⭐ Research Gap!', color: 'gold' };
-}
-
-// Dùng AI để gợi ý hướng thu hẹp
-async function suggestNarrowTopics(keyword) {
-  const prompt = `For the research topic "${keyword}", suggest 5 specific sub-topics 
-or application domains that could narrow down the research scope. Return as JSON array.`;
-  const res = await callLLM(prompt);
-  return JSON.parse(res);
-}
+    return node
 ```
 
-### API Endpoints
+### 2. FastAPI Endpoint
 
+```python
+# main.py
+from fastapi import FastAPI, Query
+from services.gap_engine import analyze_research_gap
+
+app = FastAPI()
+
+@app.get("/api/analysis/gap")
+async def get_research_gap(q: str = Query(..., description="Root keyword"), depth: int = 3):
+    result = await analyze_research_gap(q, depth)
+    return result
 ```
-GET /api/analysis/gap?q=LLM&depth=3
 
-Response:
-{
-  "keyword": "LLM",
-  "paper_count": 500000,
-  "gap_level": { "level": "saturated", "label": "🔴 Bão hòa" },
-  "children": [
-    {
-      "keyword": "LLM Agriculture",
-      "paper_count": 3000,
-      "gap_level": { "level": "emerging", "label": "🟢 Đang phát triển" },
-      "children": [
-        {
-          "keyword": "LLM Smart Farming",
-          "paper_count": 150,
-          "gap_level": { "level": "opportunity", "label": "💎 Research Opportunity" },
-          "children": [
+### 3. API Heatmap Data
+
+Để vẽ biểu đồ heatmap bên Frontend (như SCR-004), bạn cần một endpoint trả về danh sách các topic và chỉ số Gap Score.
+
+```python
+@app.get("/api/analysis/gap/heatmap")
+async def get_gap_heatmap(field: str):
+    cursor = db.topics.find({"field_of_study": field}).sort("gap_score", -1).limit(50)
+    topics = await cursor.to_list(length=50)
+    
+    return {
+        "field": field,
+        "topics": [
             {
-              "keyword": "LLM Rice Disease Detection",
-              "paper_count": 12,
-              "gap_level": { "level": "gap", "label": "⭐ Research Gap!" }
+                "name": t["name"],
+                "count": t.get("trend_data", [{}])[-1].get("paper_count", 0),
+                "gap_score": t["gap_score"]
             }
-          ]
-        }
-      ]
+            for t in topics
+        ]
     }
-  ]
-}
-
-GET /api/analysis/gap/heatmap?field=Computer+Science
-
-Response:
-{
-  "field": "Computer Science",
-  "topics": [
-    { "name": "CNN", "year": 2023, "count": 5000, "gap_score": 0.2 },
-    { "name": "Mamba", "year": 2023, "count": 120, "gap_score": 0.85 },
-    ...
-  ]
-}
-```
-
----
-
-## Frontend — Hiển thị
-
-### Drill-down Tree View
-
-```jsx
-function GapTree({ node, level = 0 }) {
-  const [expanded, setExpanded] = useState(level < 2);
-  const indent = level * 24;
-
-  return (
-    <div style={{ marginLeft: indent }}>
-      <div className={`gap-node gap-${node.gap_level.level}`}
-           onClick={() => setExpanded(!expanded)}>
-        <span className="gap-indicator">{node.gap_level.label}</span>
-        <strong>{node.keyword}</strong>
-        <span className="paper-count">{node.paper_count.toLocaleString()} papers</span>
-      </div>
-      {expanded && node.children?.map((child, i) => (
-        <GapTree key={i} node={child} level={level + 1} />
-      ))}
-    </div>
-  );
-}
-```
-
-### Heatmap View (SCR-004)
-
-```jsx
-function GapHeatmap({ data }) {
-  // x = năm, y = topic, color = paper count (nhạt = gap)
-  return (
-    <div className="heatmap-grid">
-      {data.topics.map(topic => (
-        <div key={topic.name} className="heatmap-row">
-          <span>{topic.name}</span>
-          <div
-            className="heatmap-cell"
-            style={{
-              backgroundColor: `rgba(255, 107, 107, ${1 - topic.gap_score})`,
-              // gap_score cao → nhạt → research opportunity
-            }}
-            title={`${topic.count} papers | Gap: ${(topic.gap_score * 100).toFixed(0)}%`}
-          />
-        </div>
-      ))}
-    </div>
-  );
-}
 ```
 
 ---
 
 ## Checklist kiểm tra
-
-- [ ] `GET /api/analysis/gap?q=LLM` → trả về cây drill-down
-- [ ] Paper count giảm dần khi drill sâu
-- [ ] `gap_level` phân loại đúng (saturated/emerging/gap)
-- [ ] Heatmap render đúng màu (đậm = nhiều, nhạt = gap)
-- [ ] Click ô heatmap → navigate sang search filter đúng
+- [ ] Gọi API với `q=LLM` chạy được và trả về cây JSON phân cấp đệ quy.
+- [ ] Node con có số lượng `paper_count` giảm dần.
+- [ ] Phân loại `gap_level` chính xác dựa trên logic if/else.
+- [ ] LLM trả về đúng JSON array các sub-topics (nhờ Pydantic Schema).
